@@ -10,6 +10,7 @@ from fabweave.core.decision import Decision, allow, deny
 from fabweave.core.events import EventLog
 from fabweave.core.timebox import TimeBox
 from fabweave.dedication.tool import DedicationPolicy, policy_decision
+from fabweave.dispatch.freeze import FreezeAuthorization, FreezeRule, freeze_decision
 from fabweave.dispatch.priority import DispatchCandidate, rank_candidates
 from fabweave.energy.demand import demand_violations
 from fabweave.genealogy.carrier import GenealogyGraph
@@ -64,6 +65,51 @@ def rank_releasable(
             blocked = blocked or not release_decision(state, expected, now).allowed
         evaluated.append(replace(candidate, active_hold=blocked))
     return rank_candidates(evaluated, now)
+
+
+def rank_dispatchable(
+    candidates: list[DispatchCandidate],
+    lot_classes: dict[str, str],
+    now: int,
+    rules: list[FreezeRule],
+    authorizations: list[FreezeAuthorization],
+) -> list[DispatchCandidate]:
+    eligible: list[DispatchCandidate] = []
+    for candidate in candidates:
+        lot_class = lot_classes.get(candidate.lot_id)
+        if lot_class is None:
+            continue
+        if freeze_decision(lot_class, candidate.lot_id, now, rules, authorizations).allowed:
+            eligible.append(candidate)
+    return rank_candidates(eligible, now)
+
+
+@dataclass(frozen=True, slots=True)
+class FreezeDecisionRecord:
+    decision: Decision
+    event_sequence: int
+
+
+def record_freeze_decision(
+    log: EventLog,
+    request_id: str,
+    lot_id: str,
+    lot_class: str,
+    at: int,
+    rules: list[FreezeRule],
+    authorizations: list[FreezeAuthorization],
+) -> FreezeDecisionRecord:
+    decision = freeze_decision(lot_class, lot_id, at, rules, authorizations)
+    stream = f"dispatch-freeze:{lot_id}"
+    event = log.append(
+        stream,
+        len(log.read(stream)),
+        request_id,
+        at,
+        "dispatch_allowed" if decision.allowed else "dispatch_denied",
+        {"lot_class": lot_class, "reasons": list(decision.reasons), "evidence": dict(decision.evidence)},
+    )
+    return FreezeDecisionRecord(decision, event.sequence)
 
 
 def reserve_qualified(

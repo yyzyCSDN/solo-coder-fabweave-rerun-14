@@ -14,6 +14,17 @@ from fabweave.core.timebox import TimeBox, covered_duration, merge_timeboxes
 from fabweave.core.units import fraction_to_ppm, ppm_to_fraction
 from fabweave.core.versioning import RevisionHistory
 from fabweave.dedication.tool import DedicationPolicy, policy_decision
+from fabweave.dispatch.freeze import (
+    ENGINEERING,
+    FREEZE,
+    HOT,
+    NORMAL,
+    UNFREEZE,
+    FreezeAuthorization,
+    FreezeRule,
+    freeze_decision,
+    resolve_rule,
+)
 from fabweave.dispatch.priority import DispatchCandidate, rank_candidates
 from fabweave.energy.demand import coincident_peak, demand_violations
 from fabweave.genealogy.carrier import GenealogyGraph
@@ -40,8 +51,10 @@ from fabweave.workflows.control import (
     performance_summary,
     powered_assignment,
     qualified_assignment,
+    rank_dispatchable,
     rank_releasable,
     record_containment,
+    record_freeze_decision,
     reserve_qualified,
     rework_release_decision,
 )
@@ -125,6 +138,82 @@ def test_dispatch_excludes_held_and_frozen_lots_and_breaks_ties_stably():
         DispatchCandidate("LOT-F", 0.1, 1, frozen_until=20),
     ]
     assert [item.lot_id for item in rank_candidates(candidates, 10)] == ["LOT-A", "LOT-B"]
+
+
+def test_freeze_scopes_target_lot_classes_instead_of_all_or_nothing():
+    rules = [FreezeRule("FR-1", FREEZE, frozenset({NORMAL}), priority=1, version=1, effective_at=0)]
+    assert freeze_decision(NORMAL, "LOT-1", 10, rules, []).reasons == ("dispatch_frozen",)
+    assert freeze_decision(HOT, "LOT-2", 10, rules, []).allowed
+    assert freeze_decision(ENGINEERING, "LOT-3", 10, rules, []).allowed
+
+
+def test_freeze_overlap_resolves_by_priority_then_version_then_effective_time():
+    freeze_low = FreezeRule("FR-1", FREEZE, frozenset({HOT}), priority=1, version=9, effective_at=0)
+    unfreeze_high = FreezeRule("FR-2", UNFREEZE, frozenset({HOT}), priority=5, version=1, effective_at=0)
+    assert resolve_rule([freeze_low, unfreeze_high], HOT, 10).rule_id == "FR-2"
+    older = FreezeRule("FR-3", FREEZE, frozenset({HOT}), priority=5, version=1, effective_at=0)
+    newer = FreezeRule("FR-4", UNFREEZE, frozenset({HOT}), priority=5, version=2, effective_at=0)
+    assert resolve_rule([older, newer], HOT, 10).rule_id == "FR-4"
+    early = FreezeRule("FR-5", FREEZE, frozenset({HOT}), priority=5, version=2, effective_at=10)
+    late = FreezeRule("FR-6", UNFREEZE, frozenset({HOT}), priority=5, version=2, effective_at=20)
+    assert resolve_rule([early, late], HOT, 30).rule_id == "FR-6"
+    assert resolve_rule([early, late], HOT, 15).rule_id == "FR-5"
+
+
+def test_freeze_unfreeze_rule_carves_exception_out_of_broad_freeze():
+    rules = [
+        FreezeRule("FR-ALL", FREEZE, frozenset({NORMAL, HOT, ENGINEERING}), priority=1, version=1, effective_at=0),
+        FreezeRule("FR-ENG", UNFREEZE, frozenset({ENGINEERING}), priority=10, version=1, effective_at=5),
+    ]
+    assert freeze_decision(NORMAL, "LOT-1", 10, rules, []).reasons == ("dispatch_frozen",)
+    decision = freeze_decision(ENGINEERING, "LOT-2", 10, rules, [])
+    assert decision.allowed and decision.evidence["rule_id"] == "FR-ENG"
+    assert freeze_decision(ENGINEERING, "LOT-2", 4, rules, []).reasons == ("dispatch_frozen",)
+
+
+def test_freeze_authorization_overrides_only_inside_its_window():
+    rules = [FreezeRule("FR-1", FREEZE, frozenset({HOT}), priority=1, version=1, effective_at=0)]
+    grant = FreezeAuthorization("AUTH-1", frozenset({HOT}), TimeBox(100, 200), "SUPERVISOR", 90)
+    allowed = freeze_decision(HOT, "LOT-1", 150, rules, [grant])
+    assert allowed.allowed
+    assert allowed.evidence["override"] and allowed.evidence["authorization_id"] == "AUTH-1"
+    assert allowed.evidence["rule_id"] == "FR-1"
+    assert freeze_decision(HOT, "LOT-1", 50, rules, [grant]).reasons == ("dispatch_frozen",)
+    expired = freeze_decision(HOT, "LOT-1", 200, rules, [grant])
+    assert expired.reasons == ("dispatch_frozen",)
+    assert expired.evidence["expired_authorizations"] == ("AUTH-1",)
+
+
+def test_freeze_authorization_can_target_specific_lots():
+    rules = [FreezeRule("FR-1", FREEZE, frozenset({HOT}), priority=1, version=1, effective_at=0)]
+    grant = FreezeAuthorization("AUTH-1", frozenset({HOT}), TimeBox(0, 100), "SUPERVISOR", 0, frozenset({"LOT-1"}))
+    assert freeze_decision(HOT, "LOT-1", 10, rules, [grant]).allowed
+    assert freeze_decision(HOT, "LOT-2", 10, rules, [grant]).reasons == ("dispatch_frozen",)
+
+
+def test_freeze_decision_replays_history_with_period_accurate_evidence():
+    rules = [FreezeRule("FR-1", FREEZE, frozenset({NORMAL}), priority=1, version=1, effective_at=100)]
+    grant = FreezeAuthorization("AUTH-1", frozenset({NORMAL}), TimeBox(100, 200), "SUPERVISOR", 95)
+    before = freeze_decision(NORMAL, "LOT-1", 50, rules, [grant])
+    assert before.allowed and before.evidence["rule_id"] is None
+    during = freeze_decision(NORMAL, "LOT-1", 150, rules, [grant])
+    assert during.allowed and during.evidence["authorization_id"] == "AUTH-1"
+    after = freeze_decision(NORMAL, "LOT-1", 300, rules, [grant])
+    assert after.reasons == ("dispatch_frozen",) and after.evidence["rule_effective_at"] == 100
+
+
+def test_freeze_records_validate_scopes_actions_and_grantor():
+    with pytest.raises(ValueError):
+        FreezeRule("FR-1", FREEZE, frozenset(), priority=1, version=1, effective_at=0)
+    with pytest.raises(ValueError):
+        FreezeRule("FR-1", "pause", frozenset({HOT}), priority=1, version=1, effective_at=0)
+    with pytest.raises(ValueError):
+        FreezeRule("FR-1", FREEZE, frozenset({HOT, "PILOT"}), priority=1, version=1, effective_at=0)
+    with pytest.raises(ValueError):
+        FreezeRule("FR-1", FREEZE, frozenset({HOT}), priority=1, version=0, effective_at=0)
+    with pytest.raises(ValueError):
+        FreezeAuthorization("AUTH-1", frozenset({HOT}), TimeBox(0, 10), "", 0)
+    assert freeze_decision("PILOT", "LOT-1", 10, [], []).reasons == ("unknown_lot_class",)
 
 
 def test_reticle_batch_reservation_is_atomic_and_idempotent():
@@ -275,6 +364,40 @@ def test_rank_releasable_applies_hold_decisions_before_dispatch():
     candidates = [DispatchCandidate("A", 1, 2), DispatchCandidate("B", 2, 2)]
     holds = {"A": HoldState("H", 1, frozenset({"QA"}))}
     assert [item.lot_id for item in rank_releasable(candidates, 10, holds, {"A": 1})] == ["B"]
+
+
+def test_rank_dispatchable_excludes_frozen_and_keeps_overridden_lots():
+    candidates = [
+        DispatchCandidate("LOT-N", 1, 2),
+        DispatchCandidate("LOT-H", 1, 2),
+        DispatchCandidate("LOT-E", 1, 2),
+        DispatchCandidate("LOT-X", 1, 2),
+    ]
+    classes = {"LOT-N": NORMAL, "LOT-H": HOT, "LOT-E": ENGINEERING}
+    rules = [
+        FreezeRule("FR-ALL", FREEZE, frozenset({NORMAL, HOT, ENGINEERING}), priority=1, version=1, effective_at=0),
+        FreezeRule("FR-ENG", UNFREEZE, frozenset({ENGINEERING}), priority=5, version=1, effective_at=0),
+    ]
+    grant = FreezeAuthorization("AUTH-1", frozenset({HOT}), TimeBox(0, 100), "SUPERVISOR", 0, frozenset({"LOT-H"}))
+    ranked = rank_dispatchable(candidates, classes, 10, rules, [grant])
+    assert [item.lot_id for item in ranked] == ["LOT-E", "LOT-H"]
+    assert [item.lot_id for item in rank_dispatchable(candidates, classes, 10, rules, [])] == ["LOT-E"]
+
+
+def test_record_freeze_decision_is_idempotent_and_explains_each_outcome():
+    log = EventLog()
+    rules = [FreezeRule("FR-1", FREEZE, frozenset({HOT}), priority=1, version=1, effective_at=0)]
+    grant = FreezeAuthorization("AUTH-1", frozenset({HOT}), TimeBox(0, 100), "SUPERVISOR", 0)
+    allowed = record_freeze_decision(log, "REQ-1", "LOT-1", HOT, 50, rules, [grant])
+    replay = record_freeze_decision(log, "REQ-1", "LOT-1", HOT, 50, rules, [grant])
+    assert allowed == replay and allowed.event_sequence == 1
+    denied = record_freeze_decision(log, "REQ-2", "LOT-1", HOT, 150, rules, [grant])
+    assert denied.event_sequence == 2 and not denied.decision.allowed
+    events = log.read("dispatch-freeze:LOT-1")
+    assert [event.kind for event in events] == ["dispatch_allowed", "dispatch_denied"]
+    assert events[0].data["evidence"]["authorization_id"] == "AUTH-1"
+    assert events[1].data["reasons"] == ["dispatch_frozen"]
+    assert events[1].data["evidence"]["expired_authorizations"] == ("AUTH-1",)
 
 
 def test_reserve_qualified_is_fail_closed_and_then_atomic():
