@@ -10,6 +10,7 @@ from fabweave.core.decision import Decision, allow, deny
 from fabweave.core.events import EventLog
 from fabweave.core.timebox import TimeBox
 from fabweave.dedication.tool import DedicationPolicy, policy_decision
+from fabweave.dispatch.freeze import FreezeRule, FreezeOverride, freeze_decision
 from fabweave.dispatch.priority import DispatchCandidate, rank_candidates
 from fabweave.energy.demand import demand_violations
 from fabweave.genealogy.carrier import GenealogyGraph
@@ -64,6 +65,37 @@ def rank_releasable(
             blocked = blocked or not release_decision(state, expected, now).allowed
         evaluated.append(replace(candidate, active_hold=blocked))
     return rank_candidates(evaluated, now)
+
+
+def freeze_decisions(
+    rules: list[FreezeRule],
+    overrides: list[FreezeOverride],
+    candidates: list[DispatchCandidate],
+    batch_classes: dict[str, str],
+    now: int,
+) -> dict[str, Decision]:
+    return {
+        candidate.lot_id: freeze_decision(rules, overrides, batch_classes[candidate.lot_id], candidate.lot_id, now)
+        for candidate in candidates
+    }
+
+
+def rank_under_freeze(
+    rules: list[FreezeRule],
+    overrides: list[FreezeOverride],
+    candidates: list[DispatchCandidate],
+    batch_classes: dict[str, str],
+    now: int,
+) -> list[DispatchCandidate]:
+    """Rank dispatch after the scoped freeze layer; frozen lots never rank."""
+
+    gated = [
+        replace(candidate, active_hold=True)
+        if not freeze_decision(rules, overrides, batch_classes[candidate.lot_id], candidate.lot_id, now).allowed
+        else candidate
+        for candidate in candidates
+    ]
+    return rank_candidates(gated, now)
 
 
 def reserve_qualified(
@@ -193,6 +225,46 @@ def record_containment(
         {"scope": list(scope)},
     )
     return ContainmentRecord(tuple(event.data["scope"]), event.sequence)
+
+
+@dataclass(frozen=True, slots=True)
+class FreezeDecisionRecord:
+    request_id: str
+    allowed: bool
+    decision: Decision
+
+
+def _event_value(value: object) -> object:
+    if isinstance(value, tuple):
+        return [_event_value(item) for item in value]
+    if isinstance(value, frozenset):
+        return [_event_value(item) for item in sorted(value)]
+    return value
+
+
+def record_freeze_decision(
+    log: EventLog,
+    request_id: str,
+    decision: Decision,
+    at: int,
+) -> FreezeDecisionRecord:
+    """Persist an allow or denial so the outcome stays explainable."""
+
+    payload = {key: _event_value(value) for key, value in decision.evidence.items()}
+    event = log.append(
+        f"freeze:{request_id}",
+        0,
+        request_id,
+        at,
+        "dispatch_freeze_released" if decision.allowed else "dispatch_freeze_denied",
+        {"allowed": decision.allowed, "reasons": list(decision.reasons), "evidence": payload},
+    )
+    stored = event.data
+    return FreezeDecisionRecord(
+        request_id,
+        stored["allowed"],
+        allow(**stored["evidence"]) if stored["allowed"] else deny(*stored["reasons"], **stored["evidence"]),
+    )
 
 
 def powered_assignment(
